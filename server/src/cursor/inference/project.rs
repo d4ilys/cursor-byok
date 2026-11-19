@@ -131,22 +131,15 @@ pub(crate) fn project(
                 .iter()
                 .enumerate()
                 .map(|(index, call)| {
-                    let arguments = match &call.raw_tool_call_args {
-                        Some(raw) => serde_json::from_str(raw)?,
-                        None => call
-                            .args
-                            .as_ref()
-                            .map(prost_struct)
-                            .unwrap_or_else(|| serde_json::json!({})),
-                    };
-                    Ok(ToolCallContent {
+                    let arguments = tool_call_arguments(call);
+                    ToolCallContent {
                         index,
                         call_id: call.tool_call_id.clone(),
                         name: call.tool_name.clone(),
                         arguments,
-                    })
+                    }
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Vec<_>>();
             let thinking = message
                 .reasoning_parts
                 .iter()
@@ -234,6 +227,36 @@ fn subagent_models_task_description(
     description
 }
 
+/// Recovers a tool call's arguments from the client's echoed history.
+///
+/// Cursor streams `raw_tool_call_args` while a tool call is being generated, so
+/// an interrupted turn leaves a **truncated** JSON string in the conversation.
+/// The client replays that history on every later request, which made one
+/// interrupted answer poison the whole conversation: parsing failed with
+/// "EOF while parsing a string" and the turn was rejected as
+/// `invalid_argument` before the model was ever called.
+///
+/// Prefer the raw string when it parses (it is the client's exact encoding),
+/// fall back to the structured `args`, and finally to an empty object so a
+/// half-finished call cannot abort a turn.
+fn tool_call_arguments(call: &pb::InferenceToolCall) -> Value {
+    if let Some(raw) = call.raw_tool_call_args.as_deref() {
+        match serde_json::from_str::<Value>(raw) {
+            Ok(value) => return value,
+            Err(error) => tracing::warn!(
+                tool_name = %call.tool_name,
+                bytes = raw.len(),
+                %error,
+                "recovered truncated tool call arguments"
+            ),
+        }
+    }
+    call.args
+        .as_ref()
+        .map(prost_struct)
+        .unwrap_or_else(|| Value::Object(Map::new()))
+}
+
 fn is_task_tool(name: &str) -> bool {
     name.eq_ignore_ascii_case("Task")
 }
@@ -268,23 +291,28 @@ fn parts(content: Option<&pb::inference_core_message::Content>) -> Result<Vec<Co
 }
 
 fn parts_from_wire(parts: &[pb::InferenceContentPart]) -> Result<Vec<ContentPart>> {
-    parts
-        .iter()
-        .map(|part| match part.part.as_ref() {
-            Some(pb::inference_content_part::Part::Text(text)) => Ok(ContentPart::Text {
+    let mut output = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part.part.as_ref() {
+            Some(pb::inference_content_part::Part::Text(text)) => output.push(ContentPart::Text {
                 text: text.text.clone(),
             }),
             Some(pb::inference_content_part::Part::Image(image)) => {
-                let (mime_type, data) = image_data(&image.data, image.mime_type.as_deref())?;
-                Ok(ContentPart::Image { mime_type, data })
+                match image_data(&image.data, image.mime_type.as_deref()) {
+                    Ok((mime_type, data)) => output.push(ContentPart::Image { mime_type, data }),
+                    // A truncated image in echoed history must not fail every
+                    // later turn of the conversation.
+                    Err(error) => tracing::warn!(%error, "dropping unreadable RunInference image"),
+                }
             }
-            Some(pb::inference_content_part::Part::File(file)) => Err(Error::Protocol(format!(
-                "RunInference file content is not supported: {}",
-                file.filename.as_deref().unwrap_or(&file.media_type)
-            ))),
-            None => Err(Error::Protocol("RunInference content part is empty".into())),
-        })
-        .collect()
+            Some(pb::inference_content_part::Part::File(file)) => tracing::warn!(
+                file = file.filename.as_deref().unwrap_or(&file.media_type),
+                "dropping unsupported RunInference file content"
+            ),
+            None => tracing::warn!("dropping empty RunInference content part"),
+        }
+    }
+    Ok(output)
 }
 
 fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u8>)> {
@@ -473,6 +501,145 @@ mod tests {
             content: Some(pb::inference_core_message::Content::Text(content.into())),
             ..Default::default()
         }
+    }
+
+    fn assistant_with_tool_call(
+        args: Option<serde_json::Value>,
+        raw: Option<&str>,
+    ) -> pb::InferenceCoreMessage {
+        pb::InferenceCoreMessage {
+            role: 2,
+            content: Some(pb::inference_core_message::Content::Parts(
+                pb::InferenceContentParts {
+                    parts: vec![pb::InferenceContentPart {
+                        part: Some(pb::inference_content_part::Part::Text(
+                            pb::InferenceTextPart {
+                                text: "working".into(),
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }],
+                },
+            )),
+            tool_calls: vec![pb::InferenceToolCall {
+                tool_call_id: "call_1".into(),
+                tool_name: "StrReplace".into(),
+                args: args.map(|value| match value {
+                    serde_json::Value::Object(map) => prost_types::Struct {
+                        fields: map
+                            .into_iter()
+                            .map(|(key, value)| {
+                                (
+                                    key,
+                                    prost_types::Value {
+                                        kind: Some(Kind::StringValue(
+                                            value.as_str().unwrap_or_default().into(),
+                                        )),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                    _ => prost_types::Struct::default(),
+                }),
+                raw_tool_call_args: raw.map(str::to_owned),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn truncated_raw_tool_arguments_do_not_fail_the_turn() {
+        // What an interrupted answer leaves in the client's history: a tool
+        // call whose streamed JSON stopped mid-string.
+        let truncated = r#"{"path":"/Users/Hhm/a.md","old_string":"line one\nline two"#;
+        let input = pb::InferenceStreamRequest {
+            messages: vec![
+                text(4, "You are an assistant"),
+                assistant_with_tool_call(
+                    Some(serde_json::json!({"path": "/Users/Hhm/a.md"})),
+                    Some(truncated),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let request = project(&input, "test-model", None, &[]).expect("truncated history projects");
+        let ProjectedContent::Assistant { calls, .. } = &request.history[0].content else {
+            panic!("assistant content expected");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "StrReplace");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"path": "/Users/Hhm/a.md"})
+        );
+    }
+
+    #[test]
+    fn complete_raw_tool_arguments_are_preserved_verbatim() {
+        let raw = r#"{"path":"/tmp/a.md","new_string":"x"}"#;
+        let input = pb::InferenceStreamRequest {
+            messages: vec![
+                text(4, "You are an assistant"),
+                assistant_with_tool_call(None, Some(raw)),
+            ],
+            ..Default::default()
+        };
+
+        let request = project(&input, "test-model", None, &[]).unwrap();
+        let ProjectedContent::Assistant { calls, .. } = &request.history[0].content else {
+            panic!("assistant content expected");
+        };
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"path": "/tmp/a.md", "new_string": "x"})
+        );
+    }
+
+    #[test]
+    fn unreadable_image_part_is_dropped_instead_of_failing_the_turn() {
+        let input = pb::InferenceStreamRequest {
+            messages: vec![pb::InferenceCoreMessage {
+                role: 1,
+                content: Some(pb::inference_core_message::Content::Parts(
+                    pb::InferenceContentParts {
+                        parts: vec![
+                            pb::InferenceContentPart {
+                                part: Some(pb::inference_content_part::Part::Image(
+                                    pb::InferenceImagePart {
+                                        data: "data:image/png;base64,not-base64!!".into(),
+                                        mime_type: Some("image/png".into()),
+                                        provider_options: None,
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                            pb::InferenceContentPart {
+                                part: Some(pb::inference_content_part::Part::Text(
+                                    pb::InferenceTextPart {
+                                        text: "look".into(),
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                        ],
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let request = project(&input, "test-model", None, &[]).unwrap();
+        assert_eq!(
+            request.history[0].content,
+            ProjectedContent::Parts(vec![ContentPart::Text {
+                text: "look".into()
+            }])
+        );
     }
 
     fn byok(hash: &str, display_name: &str) -> ModelConfig {
