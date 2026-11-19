@@ -40,6 +40,24 @@ impl OutputHub {
         receiver
     }
 
+    /// The last end-stream frame this hub produced, if any.
+    ///
+    /// Used to replay a terminal frame to a client that reconnects after the
+    /// owning run has already been torn down.
+    pub fn terminal_frame(&self) -> Option<Bytes> {
+        let state = self.state.lock();
+        state
+            .history
+            .iter()
+            .rev()
+            .find(|frame| {
+                frame.first().is_some_and(|flags| {
+                    flags & crate::cursor::protocol::connect::END_STREAM_FLAG != 0
+                })
+            })
+            .cloned()
+    }
+
     pub fn close(&self) -> bool {
         let mut state = self.state.lock();
         if state.closed {

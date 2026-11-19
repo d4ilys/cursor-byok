@@ -130,6 +130,10 @@ impl TransportHandle {
         self.output.close()
     }
 
+    pub(crate) fn terminal_frame(&self) -> Option<Bytes> {
+        self.output.terminal_frame()
+    }
+
     pub(crate) fn trace(&self) -> Option<&CursorTraceRecorder> {
         Some(&self.trace)
     }

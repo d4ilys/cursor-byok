@@ -40,6 +40,33 @@ pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Re
     Ok(response)
 }
 
+/// Answers a reconnect whose run already ended: replays the run's terminal
+/// frame instead of leaving the request id route-less and blocking forever.
+pub fn terminal(frame: Option<Bytes>, trace: Option<CursorTraceRecorder>) -> Response<Body> {
+    let frame = frame.unwrap_or_else(connect::encode_end_stream);
+    if let Some(trace) = &trace {
+        trace.response_started(StatusCode::OK.as_u16());
+        trace.response_chunk("byok_server", frame.clone());
+        trace.finish(end_stream_error(&frame).as_deref());
+    }
+    let stream = async_stream::stream! {
+        yield Ok::<Bytes, Infallible>(frame);
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("connect-protocol-version", HeaderValue::from_static("1"));
+    response
+}
+
 fn local_body_stream(
     mut receiver: mpsc::UnboundedReceiver<Bytes>,
     handle: TransportHandle,

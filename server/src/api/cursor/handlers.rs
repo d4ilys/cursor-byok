@@ -229,6 +229,15 @@ async fn run_sse_handler(
             )
             .await)
         }
+        crate::cursor::transport::TransportRoute::Closed => {
+            let terminal = registry.closed_terminal(&request.request_id).await;
+            Ok(run_sse::terminal(terminal, Some(trace)))
+        }
+        crate::cursor::transport::TransportRoute::Unknown => {
+            // A clean end-stream (not an error) lets an idle or reconnecting
+            // client reset quietly instead of showing "Reconnecting…" forever.
+            Ok(run_sse::terminal(None, Some(trace)))
+        }
     }
 }
 

@@ -6,9 +6,15 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::{
+    sync::{mpsc, Mutex, Notify},
+    time::Instant,
+};
+
+use bytes::Bytes;
 
 use crate::{
     cursor::{
@@ -33,6 +39,10 @@ struct RegistryInner {
     local: Mutex<HashMap<String, LocalTransport>>,
     next_local_generation: AtomicU64,
     upstream: Mutex<HashMap<String, u64>>,
+    /// Terminal frames of recently finished local transports, kept briefly so
+    /// a client that reconnects after its run ended receives the end-stream
+    /// instead of hanging on a request id that no longer has a route.
+    closed: Mutex<HashMap<String, ClosedRoute>>,
     route_changed: Notify,
     store: Store,
     traces: CursorTraceService,
@@ -40,6 +50,24 @@ struct RegistryInner {
     plugins: Option<PluginRegistry>,
     provider: Arc<dyn Provider>,
     conversations: ConversationRegistry,
+}
+
+/// How long a `RunSSE` connection waits for its `BidiAppend` to create a
+/// route. The client normally opens the stream and appends within
+/// milliseconds; waiting forever turns a torn-down request id into an
+/// unrecoverable "Reconnecting…" loop.
+const ROUTE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shorter grace for a request id that already has a terminal frame: the
+/// client is most likely reconnecting, so a new append (if any) arrives fast.
+const ROUTE_REATTACH_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a finished transport keeps its terminal frame for reconnects.
+const CLOSED_ROUTE_TTL: Duration = Duration::from_secs(300);
+
+struct ClosedRoute {
+    terminal: Bytes,
+    closed_at: Instant,
 }
 
 #[derive(Clone)]
@@ -52,6 +80,10 @@ struct LocalTransport {
 pub enum TransportRoute {
     Local,
     Upstream(u64),
+    /// No live transport, but a recent one finished: replay its terminal frame.
+    Closed,
+    /// No live or recent transport exists for this request id.
+    Unknown,
 }
 
 impl TransportRegistry {
@@ -116,6 +148,7 @@ impl TransportRegistry {
                 local: Mutex::new(HashMap::new()),
                 next_local_generation: AtomicU64::new(1),
                 upstream: Mutex::new(HashMap::new()),
+                closed: Mutex::new(HashMap::new()),
                 route_changed: Notify::new(),
                 traces: CursorTraceService::new(store.clone()),
                 conversations: ConversationRegistry::new(
@@ -176,6 +209,9 @@ impl TransportRegistry {
             }
         }
         local.remove(request_id);
+        // A new turn owns this request id now; the previous terminal frame
+        // must no longer be replayable.
+        let _ = self.inner.closed.lock().await.remove(request_id);
         let (commands, receiver) = mpsc::channel(128);
         let output = Arc::new(OutputHub::default());
         let trace = self.inner.traces.recorder(request_id);
@@ -203,15 +239,34 @@ impl TransportRegistry {
         let lifecycle = handle.clone();
         tokio::spawn(async move {
             lifecycle.wait_transport_closed().await;
-            if let Some(registry) = registry.upgrade() {
-                let mut local = registry.local.lock().await;
-                if local
-                    .get(&request_id)
-                    .is_some_and(|transport| transport.generation == generation)
-                {
-                    local.remove(&request_id);
-                }
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            let mut local = registry.local.lock().await;
+            let owned = local
+                .get(&request_id)
+                .is_some_and(|transport| transport.generation == generation);
+            if owned {
+                local.remove(&request_id);
             }
+            drop(local);
+            if !owned {
+                return;
+            }
+            let terminal = lifecycle
+                .terminal_frame()
+                .unwrap_or_else(crate::cursor::protocol::connect::encode_end_stream);
+            let mut closed = registry.closed.lock().await;
+            closed.retain(|_, route| route.closed_at.elapsed() < CLOSED_ROUTE_TTL);
+            closed.insert(
+                request_id,
+                ClosedRoute {
+                    terminal,
+                    closed_at: Instant::now(),
+                },
+            );
+            drop(closed);
+            registry.route_changed.notify_waiters();
         });
         Ok(handle)
     }
@@ -238,18 +293,70 @@ impl TransportRegistry {
     }
 
     pub async fn wait_route(&self, request_id: &str) -> TransportRoute {
+        let wait = if self.has_closed(request_id).await {
+            ROUTE_REATTACH_GRACE
+        } else {
+            ROUTE_STARTUP_TIMEOUT
+        };
+        self.wait_route_within(request_id, wait).await
+    }
+
+    /// Waits at most `wait` for a route to appear.
+    ///
+    /// Returns [`TransportRoute::Closed`] when only a recent terminal frame
+    /// remains, and [`TransportRoute::Unknown`] when the request id has no
+    /// live or recent transport at all. Callers must answer the latter instead
+    /// of waiting again, otherwise a torn-down conversation can never recover.
+    pub async fn wait_route_within(&self, request_id: &str, wait: Duration) -> TransportRoute {
+        let deadline = Instant::now() + wait;
         loop {
             let changed = self.inner.route_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.inner.local.lock().await.contains_key(request_id) {
-                return TransportRoute::Local;
+            if let Some(route) = self.current_route(request_id).await {
+                return route;
             }
-            if let Some(generation) = self.inner.upstream.lock().await.get(request_id).copied() {
-                return TransportRoute::Upstream(generation);
+            if tokio::time::timeout_at(deadline, changed).await.is_ok() {
+                continue;
             }
-            changed.await;
+            if let Some(route) = self.current_route(request_id).await {
+                return route;
+            }
+            let mut closed = self.inner.closed.lock().await;
+            closed.retain(|_, route| route.closed_at.elapsed() < CLOSED_ROUTE_TTL);
+            return if closed.contains_key(request_id) {
+                TransportRoute::Closed
+            } else {
+                TransportRoute::Unknown
+            };
         }
+    }
+
+    async fn current_route(&self, request_id: &str) -> Option<TransportRoute> {
+        if self.inner.local.lock().await.contains_key(request_id) {
+            return Some(TransportRoute::Local);
+        }
+        self.inner
+            .upstream
+            .lock()
+            .await
+            .get(request_id)
+            .copied()
+            .map(TransportRoute::Upstream)
+    }
+
+    /// Terminal frame of a recently finished transport, replayed to a
+    /// reconnecting client.
+    pub async fn closed_terminal(&self, request_id: &str) -> Option<Bytes> {
+        let mut closed = self.inner.closed.lock().await;
+        closed.retain(|_, route| route.closed_at.elapsed() < CLOSED_ROUTE_TTL);
+        closed.get(request_id).map(|route| route.terminal.clone())
+    }
+
+    async fn has_closed(&self, request_id: &str) -> bool {
+        let mut closed = self.inner.closed.lock().await;
+        closed.retain(|_, route| route.closed_at.elapsed() < CLOSED_ROUTE_TTL);
+        closed.contains_key(request_id)
     }
 
     pub fn finish_upstream(&self, request_id: String, generation: u64) {
@@ -266,6 +373,7 @@ impl TransportRegistry {
         self.inner.conversations.shutdown().await;
         let handles = std::mem::take(&mut *self.inner.local.lock().await);
         self.inner.upstream.lock().await.clear();
+        self.inner.closed.lock().await.clear();
         for transport in handles.into_values() {
             transport.handle.disconnect().await;
             let _ = tokio::time::timeout(

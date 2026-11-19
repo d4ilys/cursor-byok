@@ -73,7 +73,11 @@ impl ConversationRuntime {
                 dependencies.store.clone(),
                 handle.clone(),
             );
-            let mut inbox = OrderedInbox::starting_at(0);
+            // The client keeps one append sequence per request id. When a
+            // transport is recreated after an interrupt or a restart, the
+            // first append it sees is the earliest unacknowledged seqno, not
+            // necessarily 0, so the inbox must adopt it as its base.
+            let mut inbox = OrderedInbox::from_first_push();
             let tool_runtime_factory = CursorToolRuntime::default();
             let context_sync =
                 RequestContextSynchronizer::new(handle.clone(), dependencies.store.clone());
