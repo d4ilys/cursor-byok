@@ -138,33 +138,105 @@ fn decode_text(value: &Value) -> Result<MessageContent> {
             parts: vec![ContentPart::Text { text: text.into() }],
         });
     }
-    let parts = content
+    let raw_parts = content
         .as_array()
-        .ok_or_else(|| Error::Protocol("Cursor message content is not an array".into()))?
-        .iter()
-        .map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => Ok(ContentPart::Text {
+        .ok_or_else(|| Error::Protocol("Cursor message content is not an array".into()))?;
+    let mut parts = Vec::with_capacity(raw_parts.len());
+    for part in raw_parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => parts.push(ContentPart::Text {
                 text: required_string(part, "text")?.into(),
             }),
             Some("image") => {
                 let mime_type = required_string(part, "mimeType")?;
-                let encoded = required_string(part, "image")?;
-                Ok(ContentPart::Image {
-                    mime_type: mime_type.into(),
-                    data: STANDARD.decode(encoded).map_err(|error| {
-                        Error::Protocol(format!("invalid Cursor image base64: {error}"))
-                    })?,
-                })
+                match decode_image_bytes(part.get("image"))? {
+                    Some(data) => parts.push(ContentPart::Image {
+                        mime_type: mime_type.into(),
+                        data,
+                    }),
+                    None => tracing::warn!(
+                        mime_type,
+                        "dropping Cursor image part without decodable data"
+                    ),
+                }
             }
-            Some(kind) => Err(Error::Protocol(format!(
-                "unsupported Cursor message content part: {kind}"
-            ))),
-            None => Err(Error::Protocol(
-                "Cursor message content part is missing type".into(),
-            )),
-        })
-        .collect::<Result<Vec<_>>>()?;
+            Some(kind) => {
+                return Err(Error::Protocol(format!(
+                    "unsupported Cursor message content part: {kind}"
+                )))
+            }
+            None => {
+                return Err(Error::Protocol(
+                    "Cursor message content part is missing type".into(),
+                ))
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push(ContentPart::Text {
+            text: "[image omitted]".into(),
+        });
+    }
     Ok(MessageContent::Parts { parts })
+}
+
+/// Decodes the many shapes Cursor uses for image bytes over JSON.
+///
+/// Older clients inline standard base64. Newer ones serialize a `Uint8Array`
+/// as `{"__type":"Uint8Array","hex":"..."}`, and some pass a byte array. A
+/// shape we cannot decode yields `None` so one historical image cannot fail an
+/// entire conversation forever.
+fn decode_image_bytes(value: Option<&Value>) -> Result<Option<Vec<u8>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(encoded) => {
+            Ok(Some(STANDARD.decode(encoded).map_err(|error| {
+                Error::Protocol(format!("invalid Cursor image base64: {error}"))
+            })?))
+        }
+        Value::Array(items) => Ok(byte_array(items)),
+        Value::Object(map) => {
+            for key in ["base64", "hex"] {
+                let Some(encoded) = map.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                let bytes = if key == "hex" {
+                    hex::decode(encoded).map_err(|error| {
+                        Error::Protocol(format!("invalid Cursor image hex: {error}"))
+                    })?
+                } else {
+                    STANDARD.decode(encoded).map_err(|error| {
+                        Error::Protocol(format!("invalid Cursor image base64: {error}"))
+                    })?
+                };
+                return Ok(Some(bytes));
+            }
+            if let Some(binary) = map.get("$binary") {
+                let encoded = binary
+                    .get("base64")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return Ok(Some(STANDARD.decode(encoded).map_err(|error| {
+                    Error::Protocol(format!("invalid Cursor image base64: {error}"))
+                })?));
+            }
+            if let Some(items) = map.get("data").and_then(Value::as_array) {
+                return Ok(byte_array(items));
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn byte_array(items: &[Value]) -> Option<Vec<u8>> {
+    items
+        .iter()
+        .map(|item| item.as_u64().filter(|value| *value <= u8::MAX as u64))
+        .map(|value| value.map(|value| value as u8))
+        .collect()
 }
 
 fn decode_assistant(value: &Value, internal_id: &str) -> Result<MessageContent> {
