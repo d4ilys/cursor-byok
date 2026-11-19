@@ -351,7 +351,7 @@ async fn bidi_handler(
             }
         }
     }
-    let decoded = bidi::decode(&request)?;
+    let decoded = resolve_default_model(&registry, bidi::decode(&request)?).await?;
     let first_model = decoded.model_id().map(str::to_owned);
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
@@ -463,6 +463,47 @@ async fn bidi_handler(
     Ok(response)
 }
 
+/// Resolves Cursor's `default` model sentinel (the "Auto" pick) to the first
+/// configured BYOK model.
+///
+/// BYOK advertises that model as the account default through
+/// `GetDefaultModel`, so treating the sentinel the same way keeps the run
+/// local. Without this, a conversation whose stored selection is `default`
+/// is forwarded to Cursor's servers, which fails outright for users who run
+/// BYOK without a reachable Cursor backend.
+async fn resolve_default_model(
+    registry: &TransportRegistry,
+    mut decoded: bidi::DecodedAppend,
+) -> Result<bidi::DecodedAppend> {
+    if decoded.model_id() != Some("default") {
+        return Ok(decoded);
+    }
+    let Some(model) = registry.store().models().await?.into_iter().next() else {
+        return Ok(decoded);
+    };
+    let Some(agent::agent_client_message::Message::RunRequest(request)) =
+        decoded.message.message.as_mut()
+    else {
+        return Ok(decoded);
+    };
+    rewrite_requested_model(request, &model.model_hash);
+    tracing::info!(
+        request_id = decoded.request_id,
+        model = %model.model_hash,
+        "resolved Cursor default model to the configured BYOK model"
+    );
+    Ok(decoded)
+}
+
+fn rewrite_requested_model(request: &mut agent::AgentRunRequest, model_hash: &str) {
+    if let Some(requested) = request.requested_model.as_mut() {
+        requested.model_id = model_hash.into();
+    }
+    if let Some(details) = request.model_details.as_mut() {
+        details.model_id = model_hash.into();
+    }
+}
+
 fn trace_outcome(
     mut metadata: serde_json::Value,
     accepted: bool,
@@ -556,6 +597,33 @@ mod parent_header_tests {
         assert_eq!(
             parent_headers(&headers(Some(""), Some("tool"))).unwrap(),
             Some(parent("tool"))
+        );
+    }
+
+    #[test]
+    fn cursor_default_model_sentinel_is_rewritten_in_every_model_field() {
+        let mut request = agent::AgentRunRequest {
+            requested_model: Some(agent::RequestedModel {
+                model_id: "default".into(),
+                ..Default::default()
+            }),
+            model_details: Some(agent::ModelDetails {
+                model_id: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        rewrite_requested_model(&mut request, "0737ced459cb233c");
+        assert_eq!(
+            request
+                .requested_model
+                .as_ref()
+                .map(|m| m.model_id.as_str()),
+            Some("0737ced459cb233c")
+        );
+        assert_eq!(
+            request.model_details.as_ref().map(|m| m.model_id.as_str()),
+            Some("0737ced459cb233c")
         );
     }
 }
